@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Certificate Manager (certmgr.sh)
+# - Multi-CA management
+# - Server cert issuance with CN/SAN
+# - Persistent storage
+# - YAML configuration support
+# - Colorful CLI output, no root required
+# ============================================================
+
+# -----------------------
+# Color and formatting
+# -----------------------
+if [[ -t 1 ]]; then
+  BOLD="\033[1m"; DIM="\033[2m"; RESET="\033[0m"
+  RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; MAGENTA="\033[35m"; CYAN="\033[36m"
+else
+  BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""
+fi
+
+log() { printf "%b\n" "$*"; }
+ok() { log "${GREEN}✔${RESET} $*"; }
+warn() { log "${YELLOW}⚠${RESET} $*"; }
+err() { log "${RED}✖${RESET} $*" >&2; }
+title() { log "${BOLD}${CYAN}$*${RESET}"; }
+section() { log "\n${BOLD}${MAGENTA}— $* —${RESET}"; }
+indent() { sed 's/^/  /'; }
+
+# -----------------------
+# Defaults and globals
+# -----------------------
+CONFIG_FILE="${CERTMGR_CONFIG:-certmgr.yaml}"
+BASE_DIR="${CERTMGR_DIR:-certs}"
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
+
+# Derived directories
+CA_DIR="$BASE_DIR/CAs"
+CERT_DIR="$BASE_DIR/issued"
+
+# -----------------------
+# Help screen
+# -----------------------
+usage() {
+  printf "%b\n" "${BOLD}Certificate Manager${RESET}"
+  printf "\n"
+  printf "%b\n" "${BOLD}Usage:${RESET}"
+  printf "  certmgr [command] [options]\n"
+  printf "\n"
+  printf "%b\n" "${BOLD}Commands:${RESET}"
+  printf "  %b%-22s%b Initialize storage directories (CAs, issued)\n" "${CYAN}" "init" "${RESET}"
+  printf "  %b%-22s%b Show current configuration and paths\n" "${CYAN}" "config" "${RESET}"
+  printf "\n"
+  printf "  %b%-22s%b Create a new CA (aliases: c, ca new)\n" "${CYAN}" "ca create" "${RESET}"
+  printf "    -n, --name <name>          CA name (required)\n"
+  printf "    --subject <DN>             Subject DN (e.g., \"/C=SE/O=Example/OU=Ops/CN=Example Root\")\n"
+  printf "    --days <n>                 Validity in days (default: 3650)\n"
+  printf "    --key-bits <n>             RSA key size (default: 4096)\n"
+  printf "    --digest <alg>             Digest (default: sha256)\n"
+  printf "  %b%-22s%b List existing CAs (alias: ls)\n" "${CYAN}" "ca list" "${RESET}"
+  printf "  %b%-22s%b Show CA details\n" "${CYAN}" "ca show" "${RESET}"
+  printf "    -n, --name <name>\n"
+  printf "\n"
+  printf "  %b%-22s%b Issue a server cert (alias: i)\n" "${CYAN}" "cert issue" "${RESET}"
+  printf "    -n, --name <name>          Output name (required)\n"
+  printf "    --cn <common-name>         Common Name (defaults to name)\n"
+  printf "    --san <san1,san2,...>      SubjectAltNames (defaults to CN)\n"
+  printf "    --ca <ca-name>             Which CA to use (auto-selected if only one exists)\n"
+  printf "    --days <n>                 Validity in days (default: 825)\n"
+  printf "    --key-bits <n>             RSA key size (default: 2048)\n"
+  printf "    --digest <alg>             Digest (default: sha256)\n"
+  printf "  %b%-22s%b List issued certs (alias: ls)\n" "${CYAN}" "cert list" "${RESET}"
+  printf "  %b%-22s%b Show issued cert details\n" "${CYAN}" "cert show" "${RESET}"
+  printf "    -n, --name <name>\n"
+  printf "\n"
+  printf "  %b%-22s%b Show this help\n" "${CYAN}" "help" "${RESET}"
+  printf "\n"
+  printf "%b\n" "${BOLD}Command Aliases:${RESET}"
+  printf "  %bcertmgr c%b              → %bcertmgr ca%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %bcertmgr ca new%b         → %bcertmgr ca create%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %bcertmgr ca ls%b          → %bcertmgr ca list%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %bcertmgr i%b              → %bcertmgr cert issue%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %bcertmgr cert ls%b        → %bcertmgr cert list%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "\n"
+  printf "%b\n" "${BOLD}Getting Started:${RESET}"
+  printf "  %b1.%b Initialize storage:      %bcertmgr init%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %b2.%b Create a CA:             %bcertmgr ca create -n myca%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %b3.%b Issue a cert (minimal):  %bcertmgr cert issue -n myserver%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
+  printf "     %b(CN, SAN, and CA auto-populated from name)%b\n" "${DIM}" "${RESET}"
+  printf "  %b4.%b Or with custom values:   %bcertmgr cert issue -n myserver --cn server.local --san server.local,192.168.1.10%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %b5.%b Check your certificates: %bcertmgr cert list%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %b6.%b View config anytime:     %bcertmgr config%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
+  printf "\n"
+  printf "%b\n" "${BOLD}Configuration (YAML):${RESET}"
+  printf "  Default: %b%s%b\n" "${DIM}" "$CONFIG_FILE" "${RESET}"
+  printf "  You can set %bCERTMGR_CONFIG%b and %bCERTMGR_DIR%b env vars.\n" "${BOLD}" "${RESET}" "${BOLD}" "${RESET}"
+  printf "\n"
+}
+
+# -----------------------
+# Minimal YAML loader
+# -----------------------
+# Supports:
+#   base_dir: certs
+#   openssl_bin: /usr/bin/openssl
+#   cas:
+#     myroot:
+#       subject: "/C=SE/O=Example/CN=Example Root CA"
+#       days: 3650
+#       key_bits: 4096
+#       digest: sha256
+#
+# Values are optional; CLI flags override config.
+# This is a lightweight parser for simple key: value structures.
+
+yaml_get_scalar() {
+  local key="$1"
+  awk -v k="$key:" '
+    /^[[:space:]]*#/ {next}
+    NF==0 {next}
+    $1==k {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "");
+      print; exit
+    }
+  ' "$CONFIG_FILE" 2>/dev/null || true
+}
+
+yaml_get_ca_field() {
+  local ca="$1" field="$2"
+  awk -v ca="$ca" -v field="$field" '
+    /^[[:space:]]*#/ {next}
+    NF==0 {next}
+    $1=="cas:" {inCas=1; next}
+    inCas && $1 ~ /^[^[:space:]]+:/ {
+      cur=gensub(/:$/,"","g",$1)
+      inCA = (cur==ca)
+      next
+    }
+    inCas && inCA && $1==field":" {
+      sub(/^[[:space:]]*[^:]+:[[:space:]]*/, "");
+      print; exit
+    }
+  ' "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# -----------------------
+# Setup
+# -----------------------
+ensure_dirs() {
+  mkdir -p "$CA_DIR" "$CERT_DIR"
+}
+
+ensure_openssl() {
+  if ! command -v "$OPENSSL_BIN" >/dev/null 2>&1; then
+    err "OpenSSL not found: $OPENSSL_BIN. Install OpenSSL or set OPENSSL_BIN."
+    exit 1
+  fi
+}
+
+# -----------------------
+# Path helpers
+# -----------------------
+ca_path() { echo "$CA_DIR/$1"; }
+ca_key() { echo "$(ca_path "$1")/private.key"; }
+ca_cert() { echo "$(ca_path "$1")/ca.crt"; }
+ca_serial() { echo "$(ca_path "$1")/serial.txt"; }
+ca_index() { echo "$(ca_path "$1")/index.txt"; }
+
+issued_path() { echo "$CERT_DIR/$1"; }
+issued_key() { echo "$(issued_path "$1")/server.key"; }
+issued_csr() { echo "$(issued_path "$1")/server.csr"; }
+issued_crt() { echo "$(issued_path "$1")/server.crt"; }
+issued_chain() { echo "$(issued_path "$1")/chain.crt"; }
+issued_conf() { echo "$(issued_path "$1")/openssl.cnf"; }
+
+# -----------------------
+# CA operations
+# -----------------------
+ca_create() {
+  local name subject days key_bits digest
+  name=""; subject=""; days=""; key_bits=""; digest=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) name="$2"; shift 2 ;;
+      --subject) subject="$2"; shift 2 ;;
+      --days) days="$2"; shift 2 ;;
+      --key-bits) key_bits="$2"; shift 2 ;;
+      --digest) digest="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && err "CA name is required (--name)" && exit 1
+
+  # Merge with YAML defaults for this CA
+  [[ -z "$subject" ]] && subject="$(yaml_get_ca_field "$name" "subject")"
+  [[ -z "$days" ]] && days="$(yaml_get_ca_field "$name" "days")"
+  [[ -z "$key_bits" ]] && key_bits="$(yaml_get_ca_field "$name" "key_bits")"
+  [[ -z "$digest" ]] && digest="$(yaml_get_ca_field "$name" "digest")"
+
+  [[ -z "$days" ]] && days=3650
+  [[ -z "$key_bits" ]] && key_bits=4096
+  [[ -z "$digest" ]] && digest="sha256"
+  [[ -z "$subject" ]] && subject="/C=SE/O=${name}/CN=${name} Root CA"
+
+  local dir; dir="$(ca_path "$name")"
+  if [[ -e "$dir" ]]; then
+    warn "CA '$name' already exists at $dir"
+    return 0
+  fi
+
+  section "Creating CA '$name'"
+  mkdir -p "$dir"
+  printf "01\n" > "$(ca_serial "$name")"
+  touch "$(ca_index "$name")"
+
+  title "Generating private key"
+  "$OPENSSL_BIN" genrsa "$key_bits" > "$(ca_key "$name")"
+  chmod 600 "$(ca_key "$name")"
+  ok "Key: $(ca_key "$name")"
+
+  title "Creating self-signed CA certificate"
+  "$OPENSSL_BIN" req -x509 -new -"$digest" -days "$days" \
+    -key "$(ca_key "$name")" \
+    -subj "$subject" \
+    -out "$(ca_cert "$name")"
+  ok "Cert: $(ca_cert "$name")"
+
+  ok "CA '$name' created."
+}
+
+ca_list() {
+  section "Available CAs"
+  if [[ ! -d "$CA_DIR" ]]; then
+    warn "No CA directory found ($CA_DIR). Run 'init' or 'ca create'."
+    return 0
+  fi
+  local found=0
+  for d in "$CA_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    found=1
+    local name; name="$(basename "$d")"
+    printf "%b %s\n" "${BLUE}•${RESET}" "$name"
+  done
+  if [[ $found -eq 0 ]]; then
+    warn "No CAs present."
+  fi
+}
+
+ca_show() {
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) name="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  [[ -z "$name" ]] && err "CA name is required (--name)" && exit 1
+  local dir; dir="$(ca_path "$name")"
+  [[ -d "$dir" ]] || { err "CA '$name' not found."; exit 1; }
+
+  section "CA '$name' details"
+  printf "%b Path:%b %s\n" "$BOLD" "$RESET" "$dir"
+  printf "%b Key:%b  %s\n" "$BOLD" "$RESET" "$(ca_key "$name")"
+  printf "%b Cert:%b %s\n" "$BOLD" "$RESET" "$(ca_cert "$name")"
+  printf "%b Serial:%b %s\n" "$BOLD" "$RESET" "$(ca_serial "$name")"
+
+  if [[ -f "$(ca_cert "$name")" ]]; then
+    title "Certificate subject"
+    "$OPENSSL_BIN" x509 -noout -subject -in "$(ca_cert "$name")" | indent || true
+    title "Certificate fingerprint"
+    "$OPENSSL_BIN" x509 -noout -fingerprint -sha256 -in "$(ca_cert "$name")" | indent || true
+  fi
+}
+
+# -----------------------
+# Helper: Auto-select CA if only one exists
+# -----------------------
+auto_select_ca() {
+  local ca_count=0
+  local found_ca=""
+
+  if [[ ! -d "$CA_DIR" ]]; then
+    return 1
+  fi
+
+  for d in "$CA_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    ca_count=$((ca_count + 1))
+    found_ca="$(basename "$d")"
+  done
+
+  if [[ $ca_count -eq 1 ]]; then
+    echo "$found_ca"
+    return 0
+  fi
+
+  return 1
+}
+
+# -----------------------
+# Issuance operations
+# -----------------------
+issue_server() {
+  local out_name cn san_list ca days key_bits digest
+  out_name=""; cn=""; san_list=""; ca=""; days=""; key_bits=""; digest=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) out_name="$2"; shift 2 ;;
+      --cn) cn="$2"; shift 2 ;;
+      --san) san_list="$2"; shift 2 ;;
+      --ca) ca="$2"; shift 2 ;;
+      --days) days="$2"; shift 2 ;;
+      --key-bits) key_bits="$2"; shift 2 ;;
+      --digest) digest="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$out_name" ]] && err "Output name is required (--name)" && exit 1
+
+  # Auto-detect CN from name if not provided
+  if [[ -z "$cn" ]]; then
+    cn="$out_name"
+    warn "Auto-detected CN from name: $cn"
+  fi
+
+  # Auto-populate SAN with CN if not provided
+  if [[ -z "$san_list" ]]; then
+    san_list="$cn"
+    warn "Auto-populated SAN with CN: $san_list"
+  fi
+
+  # Auto-select CA if not provided and only one exists
+  if [[ -z "$ca" ]]; then
+    local auto_ca
+    if auto_ca="$(auto_select_ca)"; then
+      ca="$auto_ca"
+      warn "Auto-selected CA: $ca (only one available)"
+    else
+      err "CA name is required (--ca) or ensure only one CA exists for auto-selection"
+      exit 1
+    fi
+  fi
+
+  [[ -z "$days" ]] && days=825
+  [[ -z "$key_bits" ]] && key_bits=2048
+  [[ -z "$digest" ]] && digest="sha256"
+
+  local caDir; caDir="$(ca_path "$ca")"
+  [[ -d "$caDir" ]] || { err "CA '$ca' not found."; exit 1; }
+
+  local outDir; outDir="$(issued_path "$out_name")"
+  if [[ -d "$outDir" ]]; then
+    warn "Issued cert '$out_name' already exists at $outDir"
+  else
+    mkdir -p "$outDir"
+  fi
+
+  section "Issuing server certificate '$out_name' via CA '$ca'"
+
+  title "Generating server key"
+  "$OPENSSL_BIN" genrsa "$key_bits" > "$(issued_key "$out_name")"
+  chmod 600 "$(issued_key "$out_name")"
+  ok "Key: $(issued_key "$out_name")"
+
+  # OpenSSL config with SAN support
+  local conf; conf="$(issued_conf "$out_name")"
+  {
+    cat <<CONF
+[ req ]
+default_bits        = $key_bits
+distinguished_name  = req_distinguished_name
+prompt              = no
+req_extensions      = req_ext
+
+[ req_distinguished_name ]
+CN = $cn
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+CONF
+    # Expand SANs: infer DNS: or IP: if user didn't prefix
+    IFS=',' read -r -a sans <<< "$san_list"
+    local idx=1
+    for s in "${sans[@]}"; do
+      [[ -z "$s" ]] && continue
+      if [[ "$s" =~ ^(DNS|IP): ]]; then
+        # Use as provided
+        local label="${s%%:*}"; local val="${s#*:}"
+      else
+        # Infer: simple IP regex, else DNS
+        if [[ "$s" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+          label="IP"; val="$s"
+        else
+          label="DNS"; val="$s"
+        fi
+      fi
+      echo "$label.$idx = $val"
+      idx=$((idx+1))
+    done
+  } > "$conf"
+  ok "OpenSSL config with SAN: $conf"
+
+  title "Creating CSR"
+  "$OPENSSL_BIN" req -new -"$digest" -key "$(issued_key "$out_name")" -out "$(issued_csr "$out_name")" -config "$conf"
+  ok "CSR: $(issued_csr "$out_name")"
+
+  title "Signing certificate"
+  "$OPENSSL_BIN" x509 -req -"$digest" -in "$(issued_csr "$out_name")" \
+    -CA "$(ca_cert "$ca")" -CAkey "$(ca_key "$ca")" \
+    -CAcreateserial -days "$days" \
+    -extfile "$conf" -extensions req_ext \
+    -out "$(issued_crt "$out_name")"
+  ok "Cert: $(issued_crt "$out_name")"
+
+  # Build chain (leaf + CA)
+  cat "$(issued_crt "$out_name")" "$(ca_cert "$ca")" > "$(issued_chain "$out_name")"
+  ok "Chain: $(issued_chain "$out_name")"
+
+  title "Summary"
+  printf "%b\n" "  Key:    $(issued_key "$out_name")"
+  printf "%b\n" "  CSR:    $(issued_csr "$out_name")"
+  printf "%b\n" "  Cert:   $(issued_crt "$out_name")"
+  printf "%b\n" "  Chain:  $(issued_chain "$out_name")"
+}
+
+# -----------------------
+# Issued cert inspection
+# -----------------------
+issued_list() {
+  section "Issued certificates"
+  if [[ ! -d "$CERT_DIR" ]]; then
+    warn "No issued directory found ($CERT_DIR). Run 'issue server'."
+    return 0
+  fi
+  local found=0
+  for d in "$CERT_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    found=1
+    local name; name="$(basename "$d")"
+    printf "%b %s\n" "${BLUE}•${RESET}" "$name"
+  done
+  if [[ $found -eq 0 ]]; then
+    warn "No certificates present."
+  fi
+}
+
+issued_show() {
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) name="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  [[ -z "$name" ]] && err "Name is required (--name)" && exit 1
+  local dir; dir="$(issued_path "$name")"
+  [[ -d "$dir" ]] || { err "Issued cert '$name' not found."; exit 1; }
+
+  local crt_file; crt_file="$(issued_crt "$name")"
+  [[ -f "$crt_file" ]] || { err "Certificate file not found: $crt_file"; exit 1; }
+
+  section "Certificate Summary"
+
+  # Extract CN from subject
+  local cn
+  cn=$("$OPENSSL_BIN" x509 -noout -subject -in "$crt_file" 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' || echo "N/A")
+
+  # Extract SANs
+  local sans
+  sans=$("$OPENSSL_BIN" x509 -noout -text -in "$crt_file" 2>/dev/null | awk '
+    /Subject Alternative Name/ {
+      getline
+      gsub(/^[[:space:]]+/, "")
+      gsub(/DNS:/, "")
+      gsub(/IP Address:/, "")
+      gsub(/, /, ",")
+      print
+      exit
+    }
+  ' || echo "N/A")
+  [[ -z "$sans" ]] && sans="N/A"
+
+  # Extract issuer CN
+  local issuer
+  issuer=$("$OPENSSL_BIN" x509 -noout -issuer -in "$crt_file" 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' || echo "N/A")
+
+  # Extract dates
+  local not_before not_after
+  not_before=$("$OPENSSL_BIN" x509 -noout -startdate -in "$crt_file" 2>/dev/null | sed 's/notBefore=//' || echo "N/A")
+  not_after=$("$OPENSSL_BIN" x509 -noout -enddate -in "$crt_file" 2>/dev/null | sed 's/notAfter=//' || echo "N/A")
+
+  # Convert dates to YYYY-MM-DD format if possible
+  local start_date end_date
+  if command -v date >/dev/null 2>&1 && [[ "$not_before" != "N/A" ]]; then
+    start_date=$(date -d "$not_before" +"%Y-%m-%d" 2>/dev/null || echo "$not_before")
+  else
+    start_date="$not_before"
+  fi
+  if command -v date >/dev/null 2>&1 && [[ "$not_after" != "N/A" ]]; then
+    end_date=$(date -d "$not_after" +"%Y-%m-%d" 2>/dev/null || echo "$not_after")
+  else
+    end_date="$not_after"
+  fi
+
+  # Display summary
+  printf "%bName:%b      %s\n" "$BOLD" "$RESET" "$name"
+  printf "%bCN:%b        %s\n" "$BOLD" "$RESET" "$cn"
+  printf "%bSANs:%b      %s\n" "$BOLD" "$RESET" "$sans"
+  printf "%bIssuer:%b    %s\n" "$BOLD" "$RESET" "$issuer"
+  printf "%bValidity:%b  %s → %s\n" "$BOLD" "$RESET" "$start_date" "$end_date"
+
+  printf "\n%bFiles:%b\n" "$BOLD" "$RESET"
+  printf "  Key:   %s\n" "$(issued_key "$name")"
+  printf "  Cert:  %s\n" "$crt_file"
+  printf "  Chain: %s\n" "$(issued_chain "$name")"
+}
+
+# -----------------------
+# Init storage
+# -----------------------
+init_storage() {
+  section "Initializing storage"
+  ensure_dirs
+  ok "CAs directory: $CA_DIR"
+  ok "Issued directory: $CERT_DIR"
+
+  # Load YAML overrides
+  local yaml_base; yaml_base="$(yaml_get_scalar "base_dir")"
+  local yaml_bin; yaml_bin="$(yaml_get_scalar "openssl_bin")"
+  if [[ -n "$yaml_base" ]]; then
+    warn "YAML base_dir set to '$yaml_base' — using it instead of '$BASE_DIR'."
+    BASE_DIR="$yaml_base"
+    CA_DIR="$BASE_DIR/CAs"
+    CERT_DIR="$BASE_DIR/issued"
+    ensure_dirs
+    ok "Updated directories: $CA_DIR, $CERT_DIR"
+  fi
+  if [[ -n "$yaml_bin" ]]; then
+    OPENSSL_BIN="$yaml_bin"
+    ok "OpenSSL: $OPENSSL_BIN"
+  fi
+}
+
+# -----------------------
+# Show configuration
+# -----------------------
+show_config() {
+  section "Current Configuration"
+
+  # Determine sources for each config value
+  local config_file_source="default"
+  if [[ -n "${CERTMGR_CONFIG:-}" ]]; then
+    config_file_source="env:CERTMGR_CONFIG"
+  fi
+
+  local base_dir_source="default"
+  local yaml_base; yaml_base="$(yaml_get_scalar "base_dir")"
+  if [[ -n "${CERTMGR_DIR:-}" ]]; then
+    base_dir_source="env:CERTMGR_DIR"
+  elif [[ -n "$yaml_base" ]]; then
+    base_dir_source="yaml:base_dir"
+  fi
+
+  local openssl_source="default"
+  local yaml_bin; yaml_bin="$(yaml_get_scalar "openssl_bin")"
+  if [[ -n "${OPENSSL_BIN_CUSTOM:-}" ]]; then
+    openssl_source="env:OPENSSL_BIN"
+  elif [[ -n "$yaml_bin" ]]; then
+    openssl_source="yaml:openssl_bin"
+  fi
+
+  printf "%b Config file:%b %s %b[%s]%b" "$BOLD" "$RESET" "$CONFIG_FILE" "$DIM" "$config_file_source" "$RESET"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    printf " %b✓%b\n" "$GREEN" "$RESET"
+  else
+    printf " %b(not found)%b\n" "$YELLOW" "$RESET"
+  fi
+
+  printf "%b Base directory:%b %s %b[%s]%b" "$BOLD" "$RESET" "$BASE_DIR" "$DIM" "$base_dir_source" "$RESET"
+  if [[ -d "$BASE_DIR" ]]; then
+    printf " %b✓%b\n" "$GREEN" "$RESET"
+  else
+    printf " %b(not initialized)%b\n" "$YELLOW" "$RESET"
+  fi
+
+  printf "%b CA directory:%b %s" "$BOLD" "$RESET" "$CA_DIR"
+  if [[ -d "$CA_DIR" ]]; then
+    local ca_count
+    ca_count=$(find "$CA_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    printf " %b(%d CAs)%b\n" "$GREEN" "$ca_count" "$RESET"
+  else
+    printf " %b(not initialized)%b\n" "$YELLOW" "$RESET"
+  fi
+
+  printf "%b Issued directory:%b %s" "$BOLD" "$RESET" "$CERT_DIR"
+  if [[ -d "$CERT_DIR" ]]; then
+    local cert_count
+    cert_count=$(find "$CERT_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    printf " %b(%d certs)%b\n" "$GREEN" "$cert_count" "$RESET"
+  else
+    printf " %b(not initialized)%b\n" "$YELLOW" "$RESET"
+  fi
+
+  printf "%b OpenSSL binary:%b %s %b[%s]%b" "$BOLD" "$RESET" "$OPENSSL_BIN" "$DIM" "$openssl_source" "$RESET"
+  if command -v "$OPENSSL_BIN" >/dev/null 2>&1; then
+    local openssl_ver
+    openssl_ver=$("$OPENSSL_BIN" version 2>/dev/null | cut -d' ' -f2)
+    printf " %b(v%s)%b\n" "$GREEN" "$openssl_ver" "$RESET"
+  else
+    printf " %b(not found)%b\n" "$RED" "$RESET"
+  fi
+
+  printf "\n%b Configuration Sources:%b\n" "$BOLD" "$RESET"
+  printf "  %b[default]%b      Built-in default values\n" "$DIM" "$RESET"
+  printf "  %b[yaml:key]%b     From %s\n" "$DIM" "$RESET" "$CONFIG_FILE"
+  printf "  %b[env:VAR]%b      From environment variable\n" "$DIM" "$RESET"
+
+  printf "\n%b Environment Variables:%b\n" "$BOLD" "$RESET"
+  if [[ -n "${CERTMGR_CONFIG:-}" ]]; then
+    printf "  %bCERTMGR_CONFIG:%b %s\n" "$GREEN" "$RESET" "$CERTMGR_CONFIG"
+  else
+    printf "  %bCERTMGR_CONFIG:%b %b(not set)%b\n" "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+  if [[ -n "${CERTMGR_DIR:-}" ]]; then
+    printf "  %bCERTMGR_DIR:%b    %s\n" "$GREEN" "$RESET" "$CERTMGR_DIR"
+  else
+    printf "  %bCERTMGR_DIR:%b    %b(not set)%b\n" "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+  if [[ -n "${OPENSSL_BIN:-}" ]] && [[ "${OPENSSL_BIN}" != "openssl" ]]; then
+    printf "  %bOPENSSL_BIN:%b    %s\n" "$GREEN" "$RESET" "$OPENSSL_BIN"
+  else
+    printf "  %bOPENSSL_BIN:%b    %b(not set)%b\n" "$DIM" "$RESET" "$DIM" "$RESET"
+  fi
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    printf "\n%b YAML Configuration:%b\n" "$BOLD" "$RESET"
+    if [[ -n "$yaml_base" ]]; then
+      printf "  %bbase_dir:%b       %s\n" "$GREEN" "$RESET" "$yaml_base"
+    else
+      printf "  %bbase_dir:%b       %b(not set)%b\n" "$DIM" "$RESET" "$DIM" "$RESET"
+    fi
+    if [[ -n "$yaml_bin" ]]; then
+      printf "  %bopenssl_bin:%b    %s\n" "$GREEN" "$RESET" "$yaml_bin"
+    else
+      printf "  %bopenssl_bin:%b    %b(not set)%b\n" "$DIM" "$RESET" "$DIM" "$RESET"
+    fi
+  fi
+}
+
+# -----------------------
+# CLI dispatch
+# -----------------------
+main() {
+  ensure_openssl
+  local cmd="${1:-help}"; shift || true
+
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    config|info) show_config ;;
+    init) init_storage ;;
+    ca|c)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        create|new) ca_create "$@" ;;
+        list|ls) ca_list ;;
+        show) ca_show "$@" ;;
+        *) err "Unknown 'ca' subcommand: $sub"; usage; exit 1 ;;
+      esac
+      ;;
+    cert|certs)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        issue) issue_server "$@" ;;
+        list|ls) issued_list ;;
+        show) issued_show "$@" ;;
+        *) err "Unknown 'cert' subcommand: $sub"; usage; exit 1 ;;
+      esac
+      ;;
+    # Short alias for cert issue
+    i)
+      issue_server "$@"
+      ;;
+    # Backward compatibility aliases
+    issue)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        server)
+          warn "Command 'issue server' is deprecated. Use 'cert issue' instead."
+          issue_server "$@"
+          ;;
+        *) err "Unknown 'issue' subcommand: $sub. Use 'cert issue' instead."; usage; exit 1 ;;
+      esac
+      ;;
+    list)
+      warn "Command 'list' is deprecated. Use 'cert list' instead."
+      issued_list
+      ;;
+    show)
+      warn "Command 'show' is deprecated. Use 'cert show' instead."
+      issued_show "$@"
+      ;;
+    *) err "Unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+main "$@"
