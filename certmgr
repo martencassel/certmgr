@@ -38,6 +38,7 @@ OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
 # Derived directories
 CA_DIR="$BASE_DIR/CAs"
 CERT_DIR="$BASE_DIR/issued"
+TRUST_DIR="$BASE_DIR/trust"
 
 # -----------------------
 # Help screen
@@ -74,6 +75,17 @@ usage() {
   printf "  %b%-22s%b Show issued cert details\n" "${CYAN}" "cert show" "${RESET}"
   printf "    -n, --name <name>\n"
   printf "\n"
+  printf "  %b%-22s%b Create/update trust bundle from CAs\n" "${CYAN}" "trust bundle" "${RESET}"
+  printf "    -n, --name <name>          Bundle name (required)\n"
+  printf "    --ca <ca1,ca2,...>         CA names to include (or 'all')\n"
+  printf "  %b%-22s%b List trust bundles\n" "${CYAN}" "trust list" "${RESET}"
+  printf "  %b%-22s%b Show trust bundle details\n" "${CYAN}" "trust show" "${RESET}"
+  printf "    -n, --name <name>\n"
+  printf "  %b%-22s%b Export trust bundle for installation\n" "${CYAN}" "trust export" "${RESET}"
+  printf "    -n, --name <name>          Bundle name (required)\n"
+  printf "    --format <fmt>             Format: pem, ubuntu, debian, rhel, alpine, k8s-configmap, dockerfile\n"
+  printf "    -o, --output <file>        Output file (default: stdout)\n"
+  printf "\n"
   printf "  %b%-22s%b Show this help\n" "${CYAN}" "help" "${RESET}"
   printf "\n"
   printf "%b\n" "${BOLD}Command Aliases:${RESET}"
@@ -82,6 +94,7 @@ usage() {
   printf "  %bcertmgr ca ls%b          → %bcertmgr ca list%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
   printf "  %bcertmgr i%b              → %bcertmgr cert issue%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
   printf "  %bcertmgr cert ls%b        → %bcertmgr cert list%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %bcertmgr t%b              → %bcertmgr trust%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
   printf "\n"
   printf "%b\n" "${BOLD}Getting Started:${RESET}"
   printf "  %b1.%b Initialize storage:      %bcertmgr init%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
@@ -148,7 +161,7 @@ yaml_get_ca_field() {
 # Setup
 # -----------------------
 ensure_dirs() {
-  mkdir -p "$CA_DIR" "$CERT_DIR"
+  mkdir -p "$CA_DIR" "$CERT_DIR" "$TRUST_DIR"
 }
 
 ensure_openssl() {
@@ -173,6 +186,10 @@ issued_csr() { echo "$(issued_path "$1")/server.csr"; }
 issued_crt() { echo "$(issued_path "$1")/server.crt"; }
 issued_chain() { echo "$(issued_path "$1")/chain.crt"; }
 issued_conf() { echo "$(issued_path "$1")/openssl.cnf"; }
+
+trust_path() { echo "$TRUST_DIR/$1"; }
+trust_bundle() { echo "$(trust_path "$1")/bundle.pem"; }
+trust_metadata() { echo "$(trust_path "$1")/metadata.txt"; }
 
 # -----------------------
 # CA operations
@@ -523,6 +540,381 @@ issued_show() {
 }
 
 # -----------------------
+# Trust bundle operations
+# -----------------------
+trust_bundle_create() {
+  local name ca_list
+  name=""; ca_list=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) name="$2"; shift 2 ;;
+      --ca) ca_list="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && err "Bundle name is required (--name)" && exit 1
+  [[ -z "$ca_list" ]] && err "CA list is required (--ca ca1,ca2,... or --ca all)" && exit 1
+
+  section "Creating trust bundle '$name'"
+
+  local bundle_dir; bundle_dir="$(trust_path "$name")"
+  mkdir -p "$bundle_dir"
+
+  local bundle_file; bundle_file="$(trust_bundle "$name")"
+  local metadata_file; metadata_file="$(trust_metadata "$name")"
+
+  # Clear existing bundle
+  > "$bundle_file"
+  > "$metadata_file"
+
+  # Collect CAs
+  local ca_array=()
+  if [[ "$ca_list" == "all" ]]; then
+    if [[ ! -d "$CA_DIR" ]]; then
+      err "No CA directory found. Create CAs first."
+      exit 1
+    fi
+    for d in "$CA_DIR"/*; do
+      [[ -d "$d" ]] || continue
+      ca_array+=("$(basename "$d")")
+    done
+    if [[ ${#ca_array[@]} -eq 0 ]]; then
+      err "No CAs found in $CA_DIR"
+      exit 1
+    fi
+    warn "Including all CAs: ${ca_array[*]}"
+  else
+    IFS=',' read -r -a ca_array <<< "$ca_list"
+  fi
+
+  # Append each CA cert to bundle
+  local added=0
+  for ca in "${ca_array[@]}"; do
+    [[ -z "$ca" ]] && continue
+    local ca_cert_file; ca_cert_file="$(ca_cert "$ca")"
+    if [[ ! -f "$ca_cert_file" ]]; then
+      err "CA '$ca' not found (missing: $ca_cert_file)"
+      continue
+    fi
+
+    title "Adding CA '$ca'"
+    cat "$ca_cert_file" >> "$bundle_file"
+    echo "" >> "$bundle_file"  # Blank line between certs
+
+    # Extract subject for metadata
+    local subject
+    subject=$("$OPENSSL_BIN" x509 -noout -subject -in "$ca_cert_file" 2>/dev/null | sed 's/^subject=//' || echo "N/A")
+    echo "CA: $ca" >> "$metadata_file"
+    echo "  Subject: $subject" >> "$metadata_file"
+    echo "  File: $ca_cert_file" >> "$metadata_file"
+    echo "" >> "$metadata_file"
+
+    ok "Added CA '$ca'"
+    added=$((added + 1))
+  done
+
+  if [[ $added -eq 0 ]]; then
+    err "No CAs were added to bundle"
+    rm -rf "$bundle_dir"
+    exit 1
+  fi
+
+  ok "Trust bundle created with $added CA(s): $bundle_file"
+  ok "Metadata: $metadata_file"
+}
+
+trust_list() {
+  section "Trust Bundles"
+  if [[ ! -d "$TRUST_DIR" ]]; then
+    warn "No trust directory found ($TRUST_DIR). Run 'trust bundle' first."
+    return 0
+  fi
+  local found=0
+  for d in "$TRUST_DIR"/*; do
+    [[ -d "$d" ]] || continue
+    found=1
+    local name; name="$(basename "$d")"
+    local bundle_file; bundle_file="$(trust_bundle "$name")"
+    local ca_count=0
+    if [[ -f "$bundle_file" ]]; then
+      ca_count=$(grep -c "BEGIN CERTIFICATE" "$bundle_file" 2>/dev/null || echo 0)
+    fi
+    printf "%b %s %b(%d CA(s))%b\n" "${BLUE}•${RESET}" "$name" "${DIM}" "$ca_count" "${RESET}"
+  done
+  if [[ $found -eq 0 ]]; then
+    warn "No trust bundles present."
+  fi
+}
+
+trust_show() {
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) name="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  [[ -z "$name" ]] && err "Bundle name is required (--name)" && exit 1
+
+  local bundle_dir; bundle_dir="$(trust_path "$name")"
+  [[ -d "$bundle_dir" ]] || { err "Trust bundle '$name' not found."; exit 1; }
+
+  local bundle_file; bundle_file="$(trust_bundle "$name")"
+  local metadata_file; metadata_file="$(trust_metadata "$name")"
+
+  section "Trust Bundle '$name'"
+  printf "%b Bundle file:%b %s\n" "$BOLD" "$RESET" "$bundle_file"
+
+  if [[ -f "$metadata_file" ]]; then
+    printf "\n%b Included CAs:%b\n" "$BOLD" "$RESET"
+    cat "$metadata_file" | indent
+  fi
+
+  if [[ -f "$bundle_file" ]]; then
+    local ca_count
+    ca_count=$(grep -c "BEGIN CERTIFICATE" "$bundle_file" 2>/dev/null || echo 0)
+    printf "\n%b Total certificates:%b %d\n" "$BOLD" "$RESET" "$ca_count"
+
+    local size
+    size=$(wc -c < "$bundle_file")
+    printf "%b Bundle size:%b %d bytes\n" "$BOLD" "$RESET" "$size"
+  fi
+}
+
+trust_export() {
+  local name format output
+  name=""; format="pem"; output=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) name="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      -o|--output) output="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$name" ]] && err "Bundle name is required (--name)" && exit 1
+
+  local bundle_file; bundle_file="$(trust_bundle "$name")"
+  [[ -f "$bundle_file" ]] || { err "Trust bundle '$name' not found."; exit 1; }
+
+  case "$format" in
+    pem)
+      if [[ -n "$output" ]]; then
+        cp "$bundle_file" "$output"
+        ok "Exported PEM bundle to: $output"
+      else
+        cat "$bundle_file"
+      fi
+      ;;
+
+    ubuntu|debian)
+      local script
+      script=$(cat <<'UBUNTU_SCRIPT'
+#!/usr/bin/env bash
+# Install trust bundle on Ubuntu/Debian
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "This script must be run as root (use sudo)"
+  exit 1
+fi
+
+BUNDLE_FILE="__BUNDLE_NAME__.crt"
+DEST="/usr/local/share/ca-certificates/$BUNDLE_FILE"
+
+echo "Installing CA bundle to $DEST"
+cp "$BUNDLE_FILE" "$DEST"
+chmod 644 "$DEST"
+
+echo "Updating CA certificates..."
+update-ca-certificates
+
+echo "✓ Trust bundle installed successfully"
+echo "  System store: /etc/ssl/certs/ca-certificates.crt"
+UBUNTU_SCRIPT
+)
+      script="${script//__BUNDLE_NAME__/$name}"
+
+      if [[ -n "$output" ]]; then
+        echo "$script" > "$output"
+        chmod +x "$output"
+        cp "$bundle_file" "$(dirname "$output")/${name}.crt"
+        ok "Exported Ubuntu/Debian installer to: $output"
+        ok "Bundle file: $(dirname "$output")/${name}.crt"
+      else
+        echo "$script"
+      fi
+      ;;
+
+    rhel|centos)
+      local script
+      script=$(cat <<'RHEL_SCRIPT'
+#!/usr/bin/env bash
+# Install trust bundle on RHEL/CentOS/Fedora
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "This script must be run as root (use sudo)"
+  exit 1
+fi
+
+BUNDLE_FILE="__BUNDLE_NAME__.crt"
+DEST="/etc/pki/ca-trust/source/anchors/$BUNDLE_FILE"
+
+echo "Installing CA bundle to $DEST"
+cp "$BUNDLE_FILE" "$DEST"
+chmod 644 "$DEST"
+
+echo "Updating CA trust..."
+update-ca-trust
+
+echo "✓ Trust bundle installed successfully"
+echo "  System store: /etc/pki/tls/certs/ca-bundle.crt"
+RHEL_SCRIPT
+)
+      script="${script//__BUNDLE_NAME__/$name}"
+
+      if [[ -n "$output" ]]; then
+        echo "$script" > "$output"
+        chmod +x "$output"
+        cp "$bundle_file" "$(dirname "$output")/${name}.crt"
+        ok "Exported RHEL/CentOS installer to: $output"
+        ok "Bundle file: $(dirname "$output")/${name}.crt"
+      else
+        echo "$script"
+      fi
+      ;;
+
+    alpine)
+      local script
+      script=$(cat <<'ALPINE_SCRIPT'
+#!/usr/bin/env sh
+# Install trust bundle on Alpine Linux
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must be run as root"
+  exit 1
+fi
+
+BUNDLE_FILE="__BUNDLE_NAME__.crt"
+DEST="/usr/local/share/ca-certificates/$BUNDLE_FILE"
+
+echo "Installing CA bundle to $DEST"
+cp "$BUNDLE_FILE" "$DEST"
+chmod 644 "$DEST"
+
+echo "Updating CA certificates..."
+update-ca-certificates
+
+echo "✓ Trust bundle installed successfully"
+echo "  System store: /etc/ssl/certs/ca-certificates.crt"
+ALPINE_SCRIPT
+)
+      script="${script//__BUNDLE_NAME__/$name}"
+
+      if [[ -n "$output" ]]; then
+        echo "$script" > "$output"
+        chmod +x "$output"
+        cp "$bundle_file" "$(dirname "$output")/${name}.crt"
+        ok "Exported Alpine installer to: $output"
+        ok "Bundle file: $(dirname "$output")/${name}.crt"
+      else
+        echo "$script"
+      fi
+      ;;
+
+    dockerfile)
+      local dockerfile
+      dockerfile=$(cat <<'DOCKERFILE'
+# Add custom CA trust bundle to container
+# Usage:
+#   COPY __BUNDLE_NAME__.crt /usr/local/share/ca-certificates/
+#   RUN update-ca-certificates
+#
+# For Alpine:
+FROM alpine:latest
+COPY __BUNDLE_NAME__.crt /usr/local/share/ca-certificates/
+RUN apk add --no-cache ca-certificates && \
+    update-ca-certificates
+
+# For Ubuntu/Debian:
+FROM ubuntu:latest
+COPY __BUNDLE_NAME__.crt /usr/local/share/ca-certificates/
+RUN apt-get update && \
+    apt-get install -y ca-certificates && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# For RHEL/CentOS:
+FROM centos:latest
+COPY __BUNDLE_NAME__.crt /etc/pki/ca-trust/source/anchors/
+RUN update-ca-trust
+DOCKERFILE
+)
+      dockerfile="${dockerfile//__BUNDLE_NAME__/$name}"
+
+      if [[ -n "$output" ]]; then
+        echo "$dockerfile" > "$output"
+        cp "$bundle_file" "$(dirname "$output")/${name}.crt"
+        ok "Exported Dockerfile snippets to: $output"
+        ok "Bundle file: $(dirname "$output")/${name}.crt"
+      else
+        echo "$dockerfile"
+      fi
+      ;;
+
+    k8s-configmap|k8s)
+      local configmap
+      configmap=$(cat <<CONFIGMAP_START
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${name}-ca-bundle
+  namespace: default
+data:
+  ca-bundle.crt: |
+CONFIGMAP_START
+)
+      # Indent bundle content with 4 spaces
+      local bundle_content
+      bundle_content=$(sed 's/^/    /' "$bundle_file")
+      configmap="${configmap}
+${bundle_content}"
+
+      if [[ -n "$output" ]]; then
+        echo "$configmap" > "$output"
+        ok "Exported Kubernetes ConfigMap to: $output"
+        echo ""
+        echo "Usage in Pod:"
+        echo "  volumes:"
+        echo "  - name: ca-bundle"
+        echo "    configMap:"
+        echo "      name: ${name}-ca-bundle"
+        echo "  containers:"
+        echo "  - name: myapp"
+        echo "    volumeMounts:"
+        echo "    - name: ca-bundle"
+        echo "      mountPath: /etc/ssl/certs/ca-bundle.crt"
+        echo "      subPath: ca-bundle.crt"
+      else
+        echo "$configmap"
+      fi
+      ;;
+
+    *)
+      err "Unknown format: $format"
+      err "Supported formats: pem, ubuntu, debian, rhel, centos, alpine, dockerfile, k8s-configmap"
+      exit 1
+      ;;
+  esac
+}
+
+# -----------------------
 # Init storage
 # -----------------------
 init_storage() {
@@ -530,6 +922,7 @@ init_storage() {
   ensure_dirs
   ok "CAs directory: $CA_DIR"
   ok "Issued directory: $CERT_DIR"
+  ok "Trust directory: $TRUST_DIR"
 
   # Load YAML overrides
   local yaml_base; yaml_base="$(yaml_get_scalar "base_dir")"
@@ -539,8 +932,9 @@ init_storage() {
     BASE_DIR="$yaml_base"
     CA_DIR="$BASE_DIR/CAs"
     CERT_DIR="$BASE_DIR/issued"
+    TRUST_DIR="$BASE_DIR/trust"
     ensure_dirs
-    ok "Updated directories: $CA_DIR, $CERT_DIR"
+    ok "Updated directories: $CA_DIR, $CERT_DIR, $TRUST_DIR"
   fi
   if [[ -n "$yaml_bin" ]]; then
     OPENSSL_BIN="$yaml_bin"
@@ -604,6 +998,15 @@ show_config() {
     local cert_count
     cert_count=$(find "$CERT_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
     printf " %b(%d certs)%b\n" "$GREEN" "$cert_count" "$RESET"
+  else
+    printf " %b(not initialized)%b\n" "$YELLOW" "$RESET"
+  fi
+
+  printf "%b Trust directory:%b %s" "$BOLD" "$RESET" "$TRUST_DIR"
+  if [[ -d "$TRUST_DIR" ]]; then
+    local trust_count
+    trust_count=$(find "$TRUST_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    printf " %b(%d bundles)%b\n" "$GREEN" "$trust_count" "$RESET"
   else
     printf " %b(not initialized)%b\n" "$YELLOW" "$RESET"
   fi
@@ -681,6 +1084,16 @@ main() {
         list|ls) issued_list ;;
         show) issued_show "$@" ;;
         *) err "Unknown 'cert' subcommand: $sub"; usage; exit 1 ;;
+      esac
+      ;;
+    trust|t)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        bundle|create) trust_bundle_create "$@" ;;
+        list|ls) trust_list ;;
+        show) trust_show "$@" ;;
+        export) trust_export "$@" ;;
+        *) err "Unknown 'trust' subcommand: $sub"; usage; exit 1 ;;
       esac
       ;;
     # Short alias for cert issue

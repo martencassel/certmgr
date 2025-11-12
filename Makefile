@@ -77,6 +77,10 @@ test-e2e: setup-tests ## Run end-to-end workflow tests
 	@printf "$(BOLD)$(BLUE)Testing: E2E Workflows$(RESET)\n"
 	@$(BATS) $(TEST_DIR)/07_e2e_workflows.bats
 
+test-trust: setup-tests ## Run trust bundle tests
+	@printf "$(BOLD)$(BLUE)Testing: Trust Bundles$(RESET)\n"
+	@$(BATS) $(TEST_DIR)/08_trust_bundles.bats
+
 test-verbose: setup-tests ## Run all tests with verbose output
 	@printf "$(BOLD)$(BLUE)Running all tests (verbose)...$(RESET)\n"
 	@$(BATS) --verbose-run $(TEST_DIR)/*.bats

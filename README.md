@@ -13,6 +13,7 @@ A user-friendly command-line tool for managing Certificate Authorities (CAs) and
 - 💾 **Persistent Storage** - Organized directory structure for all certificates
 - 🎯 **Smart Defaults** - Auto-detect CN, SAN, and CA when possible
 - 📊 **Human-Friendly Output** - Clear certificate summaries
+- 🔒 **Trust Bundle Management** - Easy CA distribution for Ubuntu, RHEL, Alpine, K8s, containers
 
 ## Quick Start
 
@@ -29,7 +30,11 @@ A user-friendly command-line tool for managing Certificate Authorities (CAs) and
 # 4. View certificate details
 ./certmgr cert show -n myserver
 
-# 5. Check configuration
+# 5. Create trust bundle and export for Ubuntu
+./certmgr trust bundle -n all --ca all
+./certmgr trust export -n all --format ubuntu -o install.sh
+
+# 6. Check configuration
 ./certmgr config
 ```
 
@@ -65,6 +70,8 @@ certmgr c new -n myca          # Create CA (short form)
 certmgr c ls                   # List CAs
 certmgr i -n server            # Issue certificate (short form)
 certmgr cert ls                # List certificates
+certmgr t bundle -n all --ca all  # Create trust bundle (short form)
+certmgr t ls                   # List trust bundles
 ```
 
 ### Initialize
@@ -77,7 +84,8 @@ Creates the directory structure:
 ```
 certs/
 ├── CAs/          # Certificate Authorities
-└── issued/       # Issued certificates
+├── issued/       # Issued certificates
+└── trust/        # Trust bundles
 ```
 
 ### Certificate Authority Management
@@ -146,6 +154,84 @@ Files:
   Key:   certs/issued/web01/server.key
   Cert:  certs/issued/web01/server.crt
   Chain: certs/issued/web01/chain.crt
+```
+
+### Trust Bundle Management
+
+Trust bundles make it easy to distribute your CAs to systems, containers, and Kubernetes clusters.
+
+**Create a trust bundle with all CAs:**
+```bash
+certmgr trust bundle -n all-cas --ca all
+```
+
+**Create a trust bundle with specific CAs:**
+```bash
+certmgr trust bundle -n prod-staging --ca production-ca,staging-ca
+```
+
+**List trust bundles:**
+```bash
+certmgr trust list
+```
+
+**Show bundle details:**
+```bash
+certmgr trust show -n all-cas
+```
+
+**Export for different platforms:**
+
+```bash
+# PEM format (universal)
+certmgr trust export -n all-cas --format pem -o ca-bundle.pem
+
+# Ubuntu/Debian installation script
+certmgr trust export -n all-cas --format ubuntu -o install-ubuntu.sh
+chmod +x install-ubuntu.sh
+sudo ./install-ubuntu.sh
+
+# RHEL/CentOS/Fedora installation script
+certmgr trust export -n all-cas --format rhel -o install-rhel.sh
+
+# Alpine Linux installation script
+certmgr trust export -n all-cas --format alpine -o install-alpine.sh
+
+# Dockerfile snippets for containers
+certmgr trust export -n all-cas --format dockerfile -o Dockerfile.ca
+
+# Kubernetes ConfigMap
+certmgr trust export -n all-cas --format k8s -o ca-bundle-configmap.yaml
+kubectl apply -f ca-bundle-configmap.yaml
+```
+
+**Use in Kubernetes Pod:**
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: myapp
+spec:
+  volumes:
+  - name: ca-bundle
+    configMap:
+      name: all-cas-ca-bundle
+  containers:
+  - name: myapp
+    image: myapp:latest
+    volumeMounts:
+    - name: ca-bundle
+      mountPath: /etc/ssl/certs/ca-bundle.crt
+      subPath: ca-bundle.crt
+```
+
+**Use in Dockerfile:**
+```dockerfile
+FROM ubuntu:latest
+COPY all-cas.crt /usr/local/share/ca-certificates/
+RUN apt-get update && \
+    apt-get install -y ca-certificates && \
+    update-ca-certificates
 ```
 
 ### Configuration
