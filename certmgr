@@ -85,6 +85,21 @@ usage() {
   printf "    -n, --name <name>          Bundle name (required)\n"
   printf "    --format <fmt>             Format: pem, ubuntu, debian, rhel, alpine, k8s-configmap, dockerfile\n"
   printf "    -o, --output <file>        Output file (default: stdout)\n"
+  printf "  %b%-22s%b Inject trust bundle into container\n" "${CYAN}" "trust inject" "${RESET}"
+  printf "    -n, --name <name>          Bundle name (required)\n"
+  printf "    -c, --container <name>     Container name or ID (required)\n"
+  printf "    --docker                   Use Docker (default if available)\n"
+  printf "    --podman                   Use Podman\n"
+  printf "\n"
+  printf "  %b%-22s%b Verify certificate file\n" "${CYAN}" "verify file" "${RESET}"
+  printf "    -f, --file <path>          Certificate file to verify\n"
+  printf "    --ca-file <path>           Custom CA bundle (optional)\n"
+  printf "    --ca-bundle <name>         Use trust bundle (optional)\n"
+  printf "  %b%-22s%b Verify TLS connection to URL\n" "${CYAN}" "verify url" "${RESET}"
+  printf "    -u, --url <url>            URL to verify (e.g., https://example.com)\n"
+  printf "    --ca-file <path>           Custom CA bundle (optional)\n"
+  printf "    --ca-bundle <name>         Use trust bundle (optional)\n"
+  printf "    --show-chain               Show full certificate chain\n"
   printf "\n"
   printf "  %b%-22s%b Show this help\n" "${CYAN}" "help" "${RESET}"
   printf "\n"
@@ -95,6 +110,7 @@ usage() {
   printf "  %bcertmgr i%b              → %bcertmgr cert issue%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
   printf "  %bcertmgr cert ls%b        → %bcertmgr cert list%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
   printf "  %bcertmgr t%b              → %bcertmgr trust%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
+  printf "  %bcertmgr v%b              → %bcertmgr verify%b\n" "${DIM}" "${RESET}" "${DIM}" "${RESET}"
   printf "\n"
   printf "%b\n" "${BOLD}Getting Started:${RESET}"
   printf "  %b1.%b Initialize storage:      %bcertmgr init%b\n" "${BOLD}" "${RESET}" "${DIM}" "${RESET}"
@@ -1058,6 +1074,431 @@ show_config() {
 }
 
 # -----------------------
+# Trust bundle injection (containers)
+# -----------------------
+trust_inject() {
+  local bundle_name container_name runtime
+  bundle_name=""; container_name=""; runtime=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name) bundle_name="$2"; shift 2 ;;
+      -c|--container) container_name="$2"; shift 2 ;;
+      --docker) runtime="docker"; shift ;;
+      --podman) runtime="podman"; shift ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$bundle_name" ]] && err "Bundle name is required (--name)" && exit 1
+  [[ -z "$container_name" ]] && err "Container name is required (--container)" && exit 1
+
+  local bundle_file; bundle_file="$(trust_bundle "$bundle_name")"
+  [[ ! -f "$bundle_file" ]] && err "Trust bundle '$bundle_name' not found. Run 'trust list' to see available bundles." && exit 1
+
+  # Auto-detect container runtime if not specified
+  if [[ -z "$runtime" ]]; then
+    if command -v docker >/dev/null 2>&1; then
+      runtime="docker"
+    elif command -v podman >/dev/null 2>&1; then
+      runtime="podman"
+    else
+      err "Neither docker nor podman found. Install one or specify --docker or --podman."
+      exit 1
+    fi
+  fi
+
+  # Verify container exists and is running
+  if ! $runtime inspect "$container_name" >/dev/null 2>&1; then
+    err "Container '$container_name' not found or not accessible"
+    exit 1
+  fi
+
+  section "Injecting trust bundle '$bundle_name' into container '$container_name'"
+
+  # Detect OS in container
+  title "Detecting container OS"
+  local os_info
+  os_info=$($runtime exec "$container_name" sh -c 'cat /etc/os-release 2>/dev/null || echo "ID=unknown"' 2>/dev/null)
+  local os_id
+  os_id=$(echo "$os_info" | grep "^ID=" | cut -d= -f2 | tr -d '"')
+
+  printf "  Detected OS: %s\n" "$os_id"
+
+  # Determine installation strategy based on OS
+  local cert_dir update_cmd bundle_name_safe
+  bundle_name_safe=$(echo "$bundle_name" | tr ' /' '_')
+
+  case "$os_id" in
+    ubuntu|debian)
+      cert_dir="/usr/local/share/ca-certificates"
+      update_cmd="update-ca-certificates"
+      ok "Using Debian/Ubuntu strategy"
+      ;;
+    rhel|centos|fedora|rocky|almalinux)
+      cert_dir="/etc/pki/ca-trust/source/anchors"
+      update_cmd="update-ca-trust"
+      ok "Using RHEL/CentOS/Fedora strategy"
+      ;;
+    alpine)
+      cert_dir="/usr/local/share/ca-certificates"
+      update_cmd="update-ca-certificates"
+      ok "Using Alpine strategy"
+      ;;
+    *)
+      warn "Unknown OS '$os_id', trying Debian/Ubuntu strategy"
+      cert_dir="/usr/local/share/ca-certificates"
+      update_cmd="update-ca-certificates"
+      ;;
+  esac
+
+  # Copy bundle to container
+  title "Copying trust bundle to container"
+  local target_file="$cert_dir/${bundle_name_safe}.crt"
+
+  # Ensure target directory exists
+  if ! $runtime exec "$container_name" mkdir -p "$cert_dir" 2>/dev/null; then
+    warn "Could not create directory (may already exist)"
+  fi
+
+  if $runtime cp "$bundle_file" "$container_name:$target_file" 2>&1; then
+    ok "Copied to: $target_file"
+  else
+    err "Failed to copy bundle to container"
+    exit 1
+  fi  # Set permissions
+  title "Setting permissions"
+  if $runtime exec "$container_name" chmod 644 "$target_file" 2>&1; then
+    ok "Set permissions: 644"
+  else
+    warn "Could not set permissions (may not be critical)"
+  fi
+
+  # Update CA trust store
+  title "Updating CA trust store"
+  if $runtime exec "$container_name" sh -c "$update_cmd 2>&1" >/dev/null 2>&1; then
+    ok "CA trust store updated successfully"
+  else
+    warn "Failed to run $update_cmd (command may not be available)"
+    warn "You may need to install ca-certificates package:"
+    case "$os_id" in
+      ubuntu|debian)
+        printf "  Run: %bdocker exec %s apt-get update && apt-get install -y ca-certificates%b\n" "$DIM" "$container_name" "$RESET"
+        ;;
+      rhel|centos|fedora|rocky|almalinux)
+        printf "  Run: %bdocker exec %s yum install -y ca-certificates%b\n" "$DIM" "$container_name" "$RESET"
+        ;;
+      alpine)
+        printf "  Run: %bdocker exec %s apk add --no-cache ca-certificates%b\n" "$DIM" "$container_name" "$RESET"
+        ;;
+    esac
+  fi
+
+  # Verify installation
+  title "Verifying installation"
+  local cert_count
+  cert_count=$($runtime exec "$container_name" sh -c "grep -c 'BEGIN CERTIFICATE' '$target_file' 2>/dev/null || echo 0")
+  printf "  Certificates in bundle: %s\n" "$cert_count"
+
+  # Show where system trust store is located
+  title "System trust store location"
+  case "$os_id" in
+    ubuntu|debian|alpine)
+      printf "  %s\n" "/etc/ssl/certs/ca-certificates.crt"
+      ;;
+    rhel|centos|fedora|rocky|almalinux)
+      printf "  %s\n" "/etc/pki/tls/certs/ca-bundle.crt"
+      ;;
+  esac
+
+  ok "Trust bundle injected successfully!"
+
+  printf "\n%bNext steps:%b\n" "$BOLD" "$RESET"
+  printf "  • Applications in the container should now trust certificates signed by your CAs\n"
+  printf "  • Test with: %bcertmgr verify url -u <your-url>%b inside the container\n" "$DIM" "$RESET"
+  printf "  • Or run: %b%s exec %s curl -v https://your-service%b\n" "$DIM" "$runtime" "$container_name" "$RESET"
+}
+
+# -----------------------
+# Verify operations
+# -----------------------
+verify_file() {
+  local cert_file ca_file ca_bundle
+  cert_file=""; ca_file=""; ca_bundle=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--file) cert_file="$2"; shift 2 ;;
+      --ca-file) ca_file="$2"; shift 2 ;;
+      --ca-bundle) ca_bundle="$2"; shift 2 ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$cert_file" ]] && err "Certificate file is required (--file)" && exit 1
+  [[ ! -f "$cert_file" ]] && err "Certificate file not found: $cert_file" && exit 1
+
+  section "Verifying certificate file: $cert_file"
+
+  # Determine CA bundle to use
+  local ca_bundle_file=""
+  if [[ -n "$ca_bundle" ]]; then
+    ca_bundle_file="$(trust_bundle "$ca_bundle")"
+    if [[ ! -f "$ca_bundle_file" ]]; then
+      err "Trust bundle '$ca_bundle' not found. Run 'trust list' to see available bundles."
+      exit 1
+    fi
+    warn "Using trust bundle: $ca_bundle"
+  elif [[ -n "$ca_file" ]]; then
+    ca_bundle_file="$ca_file"
+    if [[ ! -f "$ca_bundle_file" ]]; then
+      err "CA file not found: $ca_bundle_file"
+      exit 1
+    fi
+    warn "Using CA file: $ca_bundle_file"
+  fi
+
+  # Basic certificate parsing
+  title "Certificate Information"
+  local subject issuer not_before not_after
+  subject=$("$OPENSSL_BIN" x509 -noout -subject -in "$cert_file" 2>/dev/null | sed 's/^subject=//' || echo "N/A")
+  issuer=$("$OPENSSL_BIN" x509 -noout -issuer -in "$cert_file" 2>/dev/null | sed 's/^issuer=//' || echo "N/A")
+  not_before=$("$OPENSSL_BIN" x509 -noout -startdate -in "$cert_file" 2>/dev/null | sed 's/notBefore=//' || echo "N/A")
+  not_after=$("$OPENSSL_BIN" x509 -noout -enddate -in "$cert_file" 2>/dev/null | sed 's/notAfter=//' || echo "N/A")
+
+  printf "  Subject:     %s\n" "$subject"
+  printf "  Issuer:      %s\n" "$issuer"
+  printf "  Valid From:  %s\n" "$not_before"
+  printf "  Valid Until: %s\n" "$not_after"
+
+  # Check expiry
+  title "Expiry Check"
+  local end_epoch
+  if command -v date >/dev/null 2>&1; then
+    end_epoch=$(date -d "$not_after" +%s 2>/dev/null || echo "0")
+    local now_epoch
+    now_epoch=$(date +%s)
+    local days_remaining=$(( (end_epoch - now_epoch) / 86400 ))
+
+    if [[ $days_remaining -lt 0 ]]; then
+      err "Certificate EXPIRED $((-days_remaining)) days ago"
+    elif [[ $days_remaining -lt 30 ]]; then
+      warn "Certificate expires in $days_remaining days"
+    else
+      ok "Certificate valid for $days_remaining days"
+    fi
+  else
+    warn "Cannot check expiry (date command not available)"
+  fi
+
+  # Subject Alternative Names
+  title "Subject Alternative Names"
+  local sans
+  sans=$("$OPENSSL_BIN" x509 -noout -text -in "$cert_file" 2>/dev/null | awk '
+    /Subject Alternative Name/ {
+      getline
+      gsub(/^[[:space:]]+/, "")
+      print
+      exit
+    }
+  ' || echo "")
+  if [[ -n "$sans" ]]; then
+    echo "  $sans" | sed 's/, /\n  /g'
+  else
+    warn "No SANs found"
+  fi
+
+  # Verify certificate chain
+  if [[ -n "$ca_bundle_file" ]]; then
+    title "Certificate Chain Verification"
+    if "$OPENSSL_BIN" verify -CAfile "$ca_bundle_file" "$cert_file" >/dev/null 2>&1; then
+      ok "Certificate chain is valid"
+    else
+      err "Certificate chain verification FAILED"
+      "$OPENSSL_BIN" verify -CAfile "$ca_bundle_file" "$cert_file" 2>&1 | indent
+    fi
+  else
+    title "Certificate Chain Verification (System CA Store)"
+    if "$OPENSSL_BIN" verify "$cert_file" >/dev/null 2>&1; then
+      ok "Certificate is trusted by system CA store"
+    else
+      warn "Certificate verification failed (not trusted by system CA store)"
+      "$OPENSSL_BIN" verify "$cert_file" 2>&1 | indent
+    fi
+  fi
+
+  # Key information
+  title "Key Information"
+  local key_size
+  key_size=$("$OPENSSL_BIN" x509 -noout -text -in "$cert_file" 2>/dev/null | grep -oE 'Public-Key: \([0-9]+ bit\)' || echo "Unknown")
+  printf "  %s\n" "$key_size"
+
+  # Fingerprints
+  title "Fingerprints"
+  local fp_sha256 fp_sha1
+  fp_sha256=$("$OPENSSL_BIN" x509 -noout -fingerprint -sha256 -in "$cert_file" 2>/dev/null || echo "N/A")
+  fp_sha1=$("$OPENSSL_BIN" x509 -noout -fingerprint -sha1 -in "$cert_file" 2>/dev/null || echo "N/A")
+  printf "  SHA256: %s\n" "${fp_sha256#*=}"
+  printf "  SHA1:   %s\n" "${fp_sha1#*=}"
+}
+
+verify_url() {
+  local url ca_file ca_bundle show_chain
+  url=""; ca_file=""; ca_bundle=""; show_chain=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -u|--url) url="$2"; shift 2 ;;
+      --ca-file) ca_file="$2"; shift 2 ;;
+      --ca-bundle) ca_bundle="$2"; shift 2 ;;
+      --show-chain) show_chain=1; shift ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$url" ]] && err "URL is required (--url)" && exit 1
+
+  # Ensure URL has https:// prefix
+  if [[ ! "$url" =~ ^https:// ]]; then
+    url="https://$url"
+  fi
+
+  # Extract host and port
+  local host port
+  host=$(echo "$url" | sed -E 's|https://([^:/]+).*|\1|')
+  port=$(echo "$url" | sed -E 's|https://[^:]+:([0-9]+).*|\1|')
+  [[ "$port" == "$url" ]] && port="443"
+
+  section "Verifying TLS connection: $host:$port"
+
+  # Determine CA bundle to use
+  local ca_bundle_file=""
+  local curl_ca_opt=""
+  local openssl_ca_opt=""
+
+  if [[ -n "$ca_bundle" ]]; then
+    ca_bundle_file="$(trust_bundle "$ca_bundle")"
+    if [[ ! -f "$ca_bundle_file" ]]; then
+      err "Trust bundle '$ca_bundle' not found. Run 'trust list' to see available bundles."
+      exit 1
+    fi
+    curl_ca_opt="--cacert $ca_bundle_file"
+    openssl_ca_opt="-CAfile $ca_bundle_file"
+    warn "Using trust bundle: $ca_bundle"
+  elif [[ -n "$ca_file" ]]; then
+    if [[ ! -f "$ca_file" ]]; then
+      err "CA file not found: $ca_file"
+      exit 1
+    fi
+    curl_ca_opt="--cacert $ca_file"
+    openssl_ca_opt="-CAfile $ca_file"
+    warn "Using CA file: $ca_file"
+  fi
+
+  # Try curl first (simpler, more common)
+  if command -v curl >/dev/null 2>&1; then
+    title "Connection Test (curl)"
+    if curl -sS --connect-timeout 5 -I $curl_ca_opt "$url" >/dev/null 2>&1; then
+      ok "TLS connection successful"
+      ok "Certificate is trusted"
+    else
+      local curl_exit=$?
+      if [[ $curl_exit -eq 60 ]]; then
+        err "Certificate verification FAILED (not trusted)"
+      elif [[ $curl_exit -eq 51 ]]; then
+        err "Certificate verification FAILED (CA invalid)"
+      else
+        err "Connection failed (exit code: $curl_exit)"
+      fi
+      warn "Use --ca-bundle or --ca-file to specify custom CA"
+    fi
+  fi
+
+  # Use openssl s_client for detailed certificate info
+  title "Certificate Details"
+  local cert_info
+  cert_info=$(echo | "$OPENSSL_BIN" s_client -connect "$host:$port" -servername "$host" $openssl_ca_opt 2>/dev/null)
+
+  # Extract and display certificate info
+  local subject issuer
+  subject=$(echo "$cert_info" | "$OPENSSL_BIN" x509 -noout -subject 2>/dev/null | sed 's/^subject=//' || echo "N/A")
+  issuer=$(echo "$cert_info" | "$OPENSSL_BIN" x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//' || echo "N/A")
+
+  printf "  Subject: %s\n" "$subject"
+  printf "  Issuer:  %s\n" "$issuer"
+
+  # Validity dates
+  local not_before not_after
+  not_before=$(echo "$cert_info" | "$OPENSSL_BIN" x509 -noout -startdate 2>/dev/null | sed 's/notBefore=//' || echo "N/A")
+  not_after=$(echo "$cert_info" | "$OPENSSL_BIN" x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//' || echo "N/A")
+
+  printf "  Valid From:  %s\n" "$not_before"
+  printf "  Valid Until: %s\n" "$not_after"
+
+  # Check expiry
+  if command -v date >/dev/null 2>&1 && [[ "$not_after" != "N/A" ]]; then
+    local end_epoch
+    end_epoch=$(date -d "$not_after" +%s 2>/dev/null || echo "0")
+    local now_epoch
+    now_epoch=$(date +%s)
+    local days_remaining=$(( (end_epoch - now_epoch) / 86400 ))
+
+    if [[ $days_remaining -lt 0 ]]; then
+      err "Certificate EXPIRED $((-days_remaining)) days ago"
+    elif [[ $days_remaining -lt 30 ]]; then
+      warn "Certificate expires in $days_remaining days"
+    else
+      ok "Certificate valid for $days_remaining days"
+    fi
+  fi
+
+  # SANs
+  title "Subject Alternative Names"
+  local sans
+  sans=$(echo "$cert_info" | "$OPENSSL_BIN" x509 -noout -text 2>/dev/null | awk '
+    /Subject Alternative Name/ {
+      getline
+      gsub(/^[[:space:]]+/, "")
+      print
+      exit
+    }
+  ')
+  if [[ -n "$sans" ]]; then
+    echo "  $sans" | sed 's/, /\n  /g'
+  else
+    warn "No SANs found"
+  fi
+
+  # Verify chain
+  title "Certificate Chain Verification"
+  if echo | "$OPENSSL_BIN" s_client -connect "$host:$port" -servername "$host" $openssl_ca_opt 2>&1 | grep -q "Verify return code: 0"; then
+    ok "Certificate chain is valid"
+  else
+    local verify_result
+    verify_result=$(echo | "$OPENSSL_BIN" s_client -connect "$host:$port" -servername "$host" $openssl_ca_opt 2>&1 | grep "Verify return code:" || echo "Unknown")
+    err "Certificate chain verification FAILED"
+    printf "  %s\n" "$verify_result"
+  fi
+
+  # Show full chain if requested
+  if [[ $show_chain -eq 1 ]]; then
+    title "Certificate Chain"
+    echo | "$OPENSSL_BIN" s_client -connect "$host:$port" -servername "$host" -showcerts $openssl_ca_opt 2>/dev/null | \
+      awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/ {print}' | \
+      "$OPENSSL_BIN" x509 -noout -subject -issuer 2>/dev/null | \
+      sed 's/^/  /'
+  fi
+
+  # Protocol and cipher info
+  title "TLS Protocol Information"
+  local protocol cipher
+  protocol=$(echo "$cert_info" | grep "Protocol" | awk '{print $3}' || echo "N/A")
+  cipher=$(echo "$cert_info" | grep "Cipher" | awk '{print $3}' || echo "N/A")
+  printf "  Protocol: %s\n" "$protocol"
+  printf "  Cipher:   %s\n" "$cipher"
+}
+
+# -----------------------
 # CLI dispatch
 # -----------------------
 main() {
@@ -1093,7 +1534,16 @@ main() {
         list|ls) trust_list ;;
         show) trust_show "$@" ;;
         export) trust_export "$@" ;;
+        inject) trust_inject "$@" ;;
         *) err "Unknown 'trust' subcommand: $sub"; usage; exit 1 ;;
+      esac
+      ;;
+    verify|v)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        file) verify_file "$@" ;;
+        url) verify_url "$@" ;;
+        *) err "Unknown 'verify' subcommand: $sub. Use 'verify file' or 'verify url'."; usage; exit 1 ;;
       esac
       ;;
     # Short alias for cert issue

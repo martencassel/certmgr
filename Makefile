@@ -81,6 +81,10 @@ test-trust: setup-tests ## Run trust bundle tests
 	@printf "$(BOLD)$(BLUE)Testing: Trust Bundles$(RESET)\n"
 	@$(BATS) $(TEST_DIR)/08_trust_bundles.bats
 
+test-verify: setup-tests ## Run certificate verification tests
+	@printf "$(BOLD)$(BLUE)Testing: Certificate Verification$(RESET)\n"
+	@$(BATS) $(TEST_DIR)/09_verify.bats
+
 test-verbose: setup-tests ## Run all tests with verbose output
 	@printf "$(BOLD)$(BLUE)Running all tests (verbose)...$(RESET)\n"
 	@$(BATS) --verbose-run $(TEST_DIR)/*.bats
