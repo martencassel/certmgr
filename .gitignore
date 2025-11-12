@@ -1,0 +1,6 @@
+# Certificate storage directory
+certs/
+
+# Test artifacts
+*.tmp
+*.log
