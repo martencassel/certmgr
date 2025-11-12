@@ -1,0 +1,36 @@
+# Advanced certmgr configuration
+# Demonstrates multiple CAs with different settings
+
+base_dir: /opt/certificates
+openssl_bin: /usr/bin/openssl
+
+cas:
+  root-ca:
+    subject: "/C=SE/ST=Stockholm/L=Stockholm/O=Enterprise/OU=PKI/CN=Enterprise Root CA"
+    days: 7300
+    key_bits: 4096
+    digest: sha512
+
+  intermediate-ca:
+    subject: "/C=SE/ST=Stockholm/L=Stockholm/O=Enterprise/OU=PKI/CN=Enterprise Intermediate CA"
+    days: 3650
+    key_bits: 4096
+    digest: sha384
+
+  web-ca:
+    subject: "/C=SE/O=Enterprise/OU=Web Services/CN=Web Services CA"
+    days: 1825
+    key_bits: 2048
+    digest: sha256
+
+  api-ca:
+    subject: "/C=SE/O=Enterprise/OU=API Services/CN=API Services CA"
+    days: 1825
+    key_bits: 2048
+    digest: sha256
+
+  client-ca:
+    subject: "/C=SE/O=Enterprise/OU=Client Auth/CN=Client Authentication CA"
+    days: 1095
+    key_bits: 2048
+    digest: sha256

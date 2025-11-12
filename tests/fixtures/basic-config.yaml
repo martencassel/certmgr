@@ -1,0 +1,25 @@
+# Example certmgr YAML configuration
+# This demonstrates basic configuration options
+
+base_dir: certs
+openssl_bin: openssl
+
+# CA configurations
+cas:
+  production:
+    subject: "/C=US/O=Example Corp/OU=IT Security/CN=Example Production Root CA"
+    days: 3650
+    key_bits: 4096
+    digest: sha256
+
+  staging:
+    subject: "/C=US/O=Example Corp/OU=IT Security/CN=Example Staging Root CA"
+    days: 1825
+    key_bits: 4096
+    digest: sha256
+
+  development:
+    subject: "/C=US/O=Example Corp/OU=Development/CN=Example Dev Root CA"
+    days: 365
+    key_bits: 2048
+    digest: sha256

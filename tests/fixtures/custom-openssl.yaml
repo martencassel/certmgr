@@ -1,0 +1,12 @@
+# Test configuration with custom OpenSSL path
+# Used for testing config introspection
+
+base_dir: test-certs
+openssl_bin: /custom/path/to/openssl
+
+cas:
+  testca:
+    subject: "/C=US/O=Test/CN=Test CA"
+    days: 365
+    key_bits: 2048
+    digest: sha256

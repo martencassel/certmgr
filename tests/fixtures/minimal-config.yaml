@@ -1,0 +1,4 @@
+# Minimal certmgr configuration
+# Only overrides the base directory
+
+base_dir: my-certificates
