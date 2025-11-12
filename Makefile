@@ -220,12 +220,12 @@ clean-all: clean ## Deep clean (remove all generated files)
 install: check ## Install certmgr to /usr/local/bin
 	@printf "$(BOLD)$(BLUE)Installing certmgr...$(RESET)\n"
 	@if [ -w /usr/local/bin ]; then \
-		cp "$(SCRIPT)" /usr/local/bin/certmgr; \
-		chmod +x /usr/local/bin/certmgr; \
+		install -m 755 "$(SCRIPT)" /usr/local/bin/certmgr; \
 		printf "$(GREEN)✔ Installed to /usr/local/bin/certmgr$(RESET)\n"; \
 	else \
-		printf "$(YELLOW)⚠ Permission denied. Try: sudo make install$(RESET)\n"; \
-		exit 1; \
+		printf "$(YELLOW)⚠ Root privileges required, using sudo...$(RESET)\n"; \
+		sudo install -m 755 "$(SCRIPT)" /usr/local/bin/certmgr; \
+		printf "$(GREEN)✔ Installed to /usr/local/bin/certmgr$(RESET)\n"; \
 	fi
 
 uninstall: ## Uninstall certmgr from /usr/local/bin
